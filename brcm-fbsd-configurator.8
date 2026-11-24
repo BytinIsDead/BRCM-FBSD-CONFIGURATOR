@@ -1,0 +1,137 @@
+.Dd November 24, 2026
+.Dt BRCM-FBSD-CONFIGURATOR 8
+.Os FreeBSD
+.Sh NAME
+.Nm brcm-fbsd-configurator
+.Nd configure Wi-Fi for the if_bcm4313 driver
+.Sh SYNOPSIS
+.Nm
+.Cm menu | status | scan | diagnose | version
+.Nm
+.Cm connect
+.Op Fl boot | ping | recreate | open
+.Op Fl password-file Ar file | ask-password
+.Op Fl timeout Ar seconds
+.Ar ssid
+.Nm
+.Cm wpa
+.Op Fl boot | ping | recreate
+.Op Fl timeout Ar seconds
+.Ar file
+.Sh DESCRIPTION
+The
+.Nm
+utility creates or reuses a net80211 VAP over an
+.Xr if_bcm4313 4
+parent device, scans for networks, joins open or WPA/WPA2 networks, requests an IPv4 address with DHCP, and optionally persists the configuration for boot.
+.Pp
+The driver must already be installed and loaded.
+Protected networks use
+.Xr wpa_supplicant 8
+with the FreeBSD
+.Fl Dbsd
+backend.
+Passwords are read from a hidden prompt, a file, or standard input; they are not accepted as positional arguments.
+.Sh COMMANDS
+.Bl -tag -width status
+.It Cm menu
+Run the interactive menu.
+.Cm scan
+Prepare the VAP and print normalized scan results.
+.It Cm connect
+Join the specified SSID.
+Use
+.Cm open
+for an open network, or provide a password with
+.Cm password-file
+or
+.Cm ask-password .
+.It Cm wpa
+Join using an existing
+.Xr wpa_supplicant.conf 5
+file.
+.It Cm status
+Print driver, device, interface, address, route, and counter status.
+.It Cm diagnose
+Print a labeled diagnostic report.
+.It Cm version
+Print the program version.
+.El
+.Sh OPTIONS
+.Bl -tag -width "--password-file file"
+.It Fl boot
+Persist the WPA configuration and required
+.Xr rc.conf 5
+keys.
+.It Fl ping
+Ping 8.8.8.8 after DHCP.
+.It Fl recreate
+Destroy and recreate an existing VAP when necessary.
+.It Fl open
+Join an open network.
+.It Fl password-file Ar file
+Read the passphrase from
+.Ar file .
+Use
+.Fl
+for standard input.
+.It Fl ask-password
+Prompt with terminal echo disabled.
+.It Fl timeout Ar seconds
+Set the association timeout.
+.It Fl force
+Replace an existing generated WPA configuration in boot mode.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width "BRCM_WPA_CONF"
+.It Ev WLANIF
+VAP interface name; defaults to
+.Li wlan0 .
+.It Ev WLDEV
+Parent device; defaults to the first
+.Li bcm4313*
+entry in
+.Li net.wlan.devices .
+.It Ev TIMEOUT
+Association timeout in seconds; defaults to 30.
+.It Ev BRCM_RC_CONF
+Boot configuration file; defaults to
+.Pa /etc/rc.conf .
+.It Ev BRCM_WPA_CONF
+Persistent WPA configuration; defaults to
+.Pa /etc/wpa_supplicant.conf .
+.It Ev BRCM_CTRL_DIR
+Supplicant control directory; defaults to
+.Pa /var/run/wpa_supplicant .
+.It Ev NO_TUI
+Disable dialog and interactive menus when set.
+.El
+.Sh SECURITY
+Generated WPA configurations are written with mode 0600.
+The plaintext PSK comment emitted by
+.Xr wpa_passphrase 8
+is removed.
+Existing interfaces are not destroyed unless
+.Fl recreate
+is supplied, and existing persistent WPA files are not overwritten without
+.Fl force .
+.Sh EXAMPLES
+Scan and join from the menu:
+.Pp
+.Dl sudo brcm-fbsd-configurator
+.Pp
+Join a protected network and enable boot reconnect:
+.Pp
+.Dl sudo brcm-fbsd-configurator connect --ask-password --boot MyNetwork
+.Pp
+Join an open network:
+.Pp
+.Dl sudo brcm-fbsd-configurator connect --open MyOpenNetwork
+.Sh SEE ALSO
+.Xr ifconfig 8 ,
+.Xr wpa_supplicant 8 ,
+.Xr wpa_passphrase 8 ,
+.Xr dhclient 8 ,
+.Xr rc.conf 5
+.Sh LICENSE
+ISC.

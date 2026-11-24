@@ -1,0 +1,740 @@
+#!/bin/sh
+# SPDX-License-Identifier: ISC
+# Copyright (c) 2026 Bytin
+#
+# BRCM-FBSD-CONFIGURATOR -- configure if_bcm4313 Wi-Fi on FreeBSD.
+#
+# Usage:
+#   brcm-fbsd-configurator [menu|status|scan|diagnose|version]
+#   brcm-fbsd-configurator connect [--open|--password-file FILE|--ask-password]
+#                                  [--boot] [--ping] [--recreate] SSID
+#   brcm-fbsd-configurator wpa [--boot] [--ping] [--recreate] FILE
+#
+# Environment:
+#   WLANIF=wlan0                 VAP interface name
+#   WLDEV=bcm43130               parent net80211 device (auto-detected if unset)
+#   TIMEOUT=30                   association timeout in seconds
+#   BRCM_RC_CONF=/etc/rc.conf
+#   BRCM_WPA_CONF=/etc/wpa_supplicant.conf
+#   BRCM_CTRL_DIR=/var/run/wpa_supplicant
+#   NO_TUI=1                     disable dialog and interactive menus
+
+set -u
+
+PROGRAM=${0##*/}
+VERSION=1.0.0
+WLANIF=${WLANIF:-wlan0}
+WLDEV=${WLDEV:-}
+TIMEOUT=${TIMEOUT:-30}
+RC_CONF=${BRCM_RC_CONF:-/etc/rc.conf}
+WPA_CONF=${BRCM_WPA_CONF:-/etc/wpa_supplicant.conf}
+CTRL_DIR=${BRCM_CTRL_DIR:-/var/run/wpa_supplicant}
+
+MODE=once
+PING=0
+RECREATE=0
+FORCE=0
+OPEN=0
+ASK_PASS=0
+PASSFILE=""
+SSID=""
+PASS=""
+WPA_FILE=""
+TMP=""
+
+trap cleanup 0 1 2 15
+
+cleanup()
+{
+	if [ -n "$TMP" ]; then
+		rm -f "$TMP" 2>/dev/null || true
+	fi
+}
+
+usage()
+{
+	cat <<EOF
+Usage:
+  $PROGRAM menu
+  $PROGRAM status
+  $PROGRAM scan [--recreate]
+  $PROGRAM diagnose
+  $PROGRAM connect [options] SSID
+  $PROGRAM wpa [options] FILE
+  $PROGRAM version
+
+Connect options:
+  --open                 join an open network
+  --password-file FILE   read the WPA passphrase from FILE (use - for stdin)
+  --ask-password         prompt with terminal echo disabled
+  --boot                 persist the network and enable boot reconnect
+  --ping                 ping 8.8.8.8 after DHCP
+  --recreate             destroy and recreate an existing VAP if needed
+  --timeout SECONDS      association timeout (default: $TIMEOUT)
+  --force                overwrite an existing generated WPA config
+
+WPA options:
+  --boot --ping --recreate --timeout SECONDS --force
+
+Environment:
+  WLANIF=$WLANIF
+  WLDEV=${WLDEV:-auto}
+  BRCM_RC_CONF=$RC_CONF
+  BRCM_WPA_CONF=$WPA_CONF
+  BRCM_CTRL_DIR=$CTRL_DIR
+  NO_TUI=1 disables dialog and menus.
+
+The driver must already be installed and loaded as bhnd/if_bcm4313.
+Passwords are never accepted as positional command-line arguments.
+EOF
+}
+
+die()
+{
+	printf 'ERROR: %s\n' "$*" >&2
+	exit 1
+}
+
+warn()
+{
+	printf 'WARNING: %s\n' "$*" >&2
+}
+
+note()
+{
+	printf '==> %s\n' "$*"
+}
+
+need_cmd()
+{
+	command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+need_freebsd()
+{
+	[ "$(uname -s 2>/dev/null)" = FreeBSD ] ||
+		die "this program runs on FreeBSD only"
+}
+
+need_root()
+{
+	[ "$(id -u 2>/dev/null)" = 0 ] || die "run this command as root"
+}
+
+valid_timeout()
+{
+	case "$TIMEOUT" in
+	''|*[!0-9]*) die "TIMEOUT must be a positive integer" ;;
+	esac
+	[ "$TIMEOUT" -gt 0 ] || die "TIMEOUT must be greater than zero"
+}
+
+find_wldev()
+{
+	if [ -n "$WLDEV" ]; then
+		printf '%s\n' "$WLDEV"
+		return 0
+	fi
+	sysctl -n net.wlan.devices 2>/dev/null |
+		tr ' ' '\n' | awk '/^bcm4313[0-9]*$/ { print; exit }'
+}
+
+ensure_driver()
+{
+	need_cmd kldstat
+	need_cmd sysctl
+	kldstat -q -m 'bhnd/if_bcm4313' ||
+		die "if_bcm4313 is not loaded; install/load the driver first"
+	WLDEV=$(find_wldev)
+	[ -n "$WLDEV" ] ||
+		die "no bcm4313* net80211 device found; check dmesg and sysctl net.wlan.devices"
+}
+
+iface_parent()
+{
+	p=$(ifconfig "$WLANIF" wlandev 2>/dev/null | awk '{ print $NF; exit }')
+	if [ -z "$p" ]; then
+		p=$(ifconfig "$WLANIF" 2>/dev/null |
+		    awk '/parent interface|wlandev/ { print $NF; exit }')
+	fi
+	printf '%s\n' "${p##* }"
+}
+
+prepare_interface()
+{
+	need_cmd ifconfig
+	if ifconfig "$WLANIF" >/dev/null 2>&1; then
+		parent=$(iface_parent)
+		if [ "$RECREATE" -eq 1 ]; then
+			note "recreating $WLANIF over $WLDEV"
+			ifconfig "$WLANIF" down 2>/dev/null || true
+			ifconfig "$WLANIF" destroy 2>/dev/null ||
+				die "could not destroy $WLANIF"
+		elif [ "$parent" != "$WLDEV" ]; then
+			die "$WLANIF belongs to '${parent:-unknown}', not $WLDEV; use --recreate to replace it"
+		fi
+	fi
+	if ! ifconfig "$WLANIF" >/dev/null 2>&1; then
+		ifconfig "$WLANIF" create wlandev "$WLDEV" ||
+			die "could not create $WLANIF over $WLDEV"
+	fi
+	ifconfig "$WLANIF" up || die "could not bring $WLANIF up"
+}
+
+wait_associated()
+{
+	i=0
+	while [ "$i" -lt "$TIMEOUT" ]; do
+		if ifconfig "$WLANIF" 2>/dev/null | grep -q 'status: associated'; then
+			printf '\n'
+			return 0
+		fi
+		i=$((i + 1))
+		[ "$i" -lt "$TIMEOUT" ] && sleep 1
+	done
+	printf '\n'
+	die "no association after ${TIMEOUT}s; check the channel, credentials, and dmesg"
+}
+
+current_ip()
+{
+	ifconfig "$WLANIF" 2>/dev/null | awk '/inet / { print $2; exit }'
+}
+
+default_gateway()
+{
+	netstat -rn 2>/dev/null | awk '$1 == "default" { print $2; exit }'
+}
+
+run_dhcp()
+{
+	need_cmd dhclient
+	note "requesting an address with dhclient $WLANIF"
+	dhclient "$WLANIF" || die "dhclient failed on $WLANIF"
+	i=0
+	while [ "$i" -lt 10 ]; do
+		[ -n "$(current_ip)" ] && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	warn "associated, but no IPv4 address appeared; inspect dhclient and the router"
+}
+
+read_password()
+{
+	[ -z "$PASS" ] || return 0
+	if [ -n "$PASSFILE" ]; then
+		if [ "$PASSFILE" = - ]; then
+			PASS=$(cat)
+		else
+			[ -f "$PASSFILE" ] || die "password file not found: $PASSFILE"
+			PASS=$(cat "$PASSFILE")
+		fi
+	elif [ "$ASK_PASS" -eq 1 ] || [ -t 0 ]; then
+		printf 'WPA password: '
+		stty -echo 2>/dev/null || true
+		IFS= read -r PASS || die "could not read the WPA password"
+		stty echo 2>/dev/null || true
+		printf '\n'
+	else
+		die "a WPA network needs --password-file or --ask-password"
+	fi
+	[ -n "$PASS" ] || die "the WPA password is empty"
+}
+
+write_wpa_config()
+{
+	dest=$1
+	need_cmd wpa_passphrase
+	block=$(wpa_passphrase "$SSID" "$PASS") ||
+		die "wpa_passphrase failed for SSID '$SSID'"
+	{
+		printf 'ctrl_interface=%s\n' "$CTRL_DIR"
+		printf '%s\n' "$block" | sed '/^[[:space:]]*#psk=/d'
+	} > "$dest" || die "could not write $dest"
+	chmod 600 "$dest" || die "could not secure $dest"
+	unset block
+}
+
+persist_inline_wpa()
+{
+	dir=$(dirname "$WPA_CONF")
+	[ -d "$dir" ] || die "WPA config directory does not exist: $dir"
+	if [ -f "$WPA_CONF" ] && [ "$FORCE" -ne 1 ]; then
+		die "$WPA_CONF already exists; use --force to replace it or set BRCM_WPA_CONF"
+	fi
+	TMP=$(umask 077; mktemp "$dir/.brcm-fbsd-wpa.XXXXXXXX") ||
+		die "could not create a temporary WPA config in $dir"
+	write_wpa_config "$TMP"
+	mv "$TMP" "$WPA_CONF" || die "could not install $WPA_CONF"
+	TMP=""
+}
+
+persist_wpa_file()
+{
+	src=$1
+	[ -f "$src" ] || die "wpa_supplicant config not found: $src"
+	if [ "$src" = "$WPA_CONF" ]; then
+		chmod 600 "$WPA_CONF" || die "could not secure $WPA_CONF"
+		return 0
+	fi
+	dir=$(dirname "$WPA_CONF")
+	[ -d "$dir" ] || die "WPA config directory does not exist: $dir"
+	if [ -f "$WPA_CONF" ] && [ "$FORCE" -ne 1 ]; then
+		die "$WPA_CONF already exists; use --force to replace it or set BRCM_WPA_CONF"
+	fi
+	TMP=$(umask 077; mktemp "$dir/.brcm-fbsd-wpa.XXXXXXXX") ||
+		die "could not create a temporary WPA config in $dir"
+	cat "$src" > "$TMP" || die "could not copy $src"
+	chmod 600 "$TMP" || die "could not secure $TMP"
+	mv "$TMP" "$WPA_CONF" || die "could not install $WPA_CONF"
+	TMP=""
+}
+
+start_wpa()
+{
+	conf=$1
+	need_cmd wpa_supplicant
+	mkdir -p "$CTRL_DIR" || die "could not create $CTRL_DIR"
+	wpa_supplicant -B -Dbsd -i "$WLANIF" -c "$conf" -C "$CTRL_DIR" ||
+		die "wpa_supplicant failed; run it in the foreground with -dd for details"
+}
+
+ensure_rc_key()
+{
+	key=$1
+	value=$2
+	[ -f "$RC_CONF" ] || die "rc.conf not found: $RC_CONF"
+	line=$(grep "^${key}=" "$RC_CONF" 2>/dev/null | tail -1)
+	if [ -z "$line" ]; then
+		printf '%s="%s"\n' "$key" "$value" >> "$RC_CONF" ||
+			die "could not update $RC_CONF"
+		return 0
+	fi
+	current=${line#*=}
+	current=$(printf '%s\n' "$current" | sed 's/^"//; s/"$//')
+	[ "$current" = "$value" ] ||
+		die "$RC_CONF already sets $key=$current; expected $value"
+}
+
+ensure_boot()
+{
+	security=$1
+	ensure_rc_key "wlans_if_${WLDEV}" "$WLANIF"
+	if [ "$security" = wpa ]; then
+		ensure_rc_key "ifconfig_${WLANIF}" "WPA DHCP"
+		ensure_rc_key wpa_supplicant_enable YES
+	else
+		ensure_rc_key "ifconfig_${WLANIF}" DHCP
+	fi
+	note "boot reconnect configured in $RC_CONF"
+}
+
+print_summary()
+{
+	ip=$(current_ip)
+	gw=$(default_gateway)
+	printf '\nConnected to %s on %s.\n' "$SSID" "$WLANIF"
+	[ -n "$ip" ] && printf 'IPv4 address: %s\n' "$ip" || printf 'IPv4 address: pending\n'
+	[ -n "$gw" ] && printf 'Default route: %s\n' "$gw" || printf 'Default route: none\n'
+	if [ "$PING" -eq 1 ]; then
+		if ping -c 3 -t 5 8.8.8.8 >/dev/null 2>&1; then
+			printf 'Ping: ok\n'
+		else
+			warn "ping to 8.8.8.8 failed"
+		fi
+	fi
+}
+
+connect_inline()
+{
+	[ -n "$SSID" ] || die "connect needs an SSID"
+	need_freebsd
+	need_root
+	valid_timeout
+	ensure_driver
+	prepare_interface
+	if [ "$OPEN" -eq 1 ]; then
+		note "joining open network '$SSID'"
+		ifconfig "$WLANIF" ssid "$SSID" up || die "could not set the SSID"
+		security=open
+	else
+		read_password
+		TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/brcm-fbsd-wpa.XXXXXXXX") ||
+			die "could not create a temporary WPA config"
+		write_wpa_config "$TMP"
+		note "joining WPA/WPA2 network '$SSID'"
+		start_wpa "$TMP"
+		security=wpa
+	fi
+	printf '==> waiting for association (up to %ss)\n' "$TIMEOUT"
+	wait_associated
+	run_dhcp
+	if [ "$MODE" = boot ]; then
+		if [ "$security" = wpa ]; then
+			persist_inline_wpa
+		fi
+		ensure_boot "$security"
+	fi
+	unset PASS
+	print_summary
+}
+
+connect_wpa_file()
+{
+	[ -n "$WPA_FILE" ] || die "wpa needs a config file"
+	[ -f "$WPA_FILE" ] || die "wpa_supplicant config not found: $WPA_FILE"
+	need_freebsd
+	need_root
+	valid_timeout
+	ensure_driver
+	prepare_interface
+	note "joining with $WPA_FILE"
+	start_wpa "$WPA_FILE"
+	SSID=$(wpa_cli -p "$CTRL_DIR" -i "$WLANIF" status 2>/dev/null |
+		awk -F= '/^ssid=/ { print $2; exit }')
+	[ -n "$SSID" ] || SSID=wpa_supplicant
+	printf '==> waiting for association (up to %ss)\n' "$TIMEOUT"
+	wait_associated
+	run_dhcp
+	if [ "$MODE" = boot ]; then
+		persist_wpa_file "$WPA_FILE"
+		ensure_boot wpa
+	fi
+	print_summary
+}
+
+scan_rows()
+{
+	ifconfig "$WLANIF" list scan 2>/dev/null | awk '
+	function trim(s) {
+		sub(/^[[:space:]]+/, "", s)
+		sub(/[[:space:]]+$/, "", s)
+		return s
+	}
+	{
+		bssid = ""
+		for (i = 1; i <= NF; i++) {
+			if ($i ~ /^([0-9A-Fa-f][0-9A-Fa-f]:){5}[0-9A-Fa-f][0-9A-Fa-f]$/) {
+				bssid = $i
+				break
+			}
+		}
+		if (bssid == "") next
+		ssid = ""
+		for (j = 1; j < i; j++)
+			ssid = ssid (ssid == "" ? "" : " ") $j
+		ssid = trim(ssid)
+		if (ssid == "" || ssid == "NULL") next
+		security = ($0 ~ /WPA|RSN/) ? "WPA" : (($0 ~ /WEP/) ? "WEP" : "open")
+		printf "%s\t%s\t%s\t%s\t%s\n", bssid, ssid, $(i + 1), $(i + 3), security
+	}'
+}
+
+do_scan()
+{
+	need_freebsd
+	need_root
+	ensure_driver
+	prepare_interface
+	note "scanning on $WLANIF" >&2
+	ifconfig "$WLANIF" scan >/dev/null 2>&1 || die "scan failed"
+	sleep 2
+	scan_rows
+}
+
+show_scan()
+{
+	TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/brcm-fbsd-scan.XXXXXXXX") ||
+		die "could not create a temporary scan file"
+	do_scan > "$TMP"
+	if [ ! -s "$TMP" ]; then
+		rm -f "$TMP"
+		TMP=""
+		warn "no networks found; try another channel or enter the SSID manually"
+		return 1
+	fi
+	printf 'BSSID\tSSID\tCHAN\tSIGNAL\tSECURITY\n'
+	cat "$TMP"
+	rm -f "$TMP"
+	TMP=""
+}
+
+status()
+{
+	need_freebsd
+	printf 'System: %s\n' "$(uname -srm)"
+	if kldstat -q -m 'bhnd/if_bcm4313' 2>/dev/null; then
+		printf 'Driver module: loaded (bhnd/if_bcm4313)\n'
+	else
+		printf 'Driver module: not loaded\n'
+	fi
+	printf 'net.wlan.devices: %s\n' "$(sysctl -n net.wlan.devices 2>/dev/null || echo unknown)"
+	WLDEV=$(find_wldev)
+	printf 'Parent device: %s\n' "${WLDEV:-none}"
+	if ifconfig "$WLANIF" >/dev/null 2>&1; then
+		printf 'Interface: %s (parent %s)\n' "$WLANIF" "$(iface_parent)"
+		ifconfig "$WLANIF" | awk '/ether |status: |inet / { print }'
+	else
+		printf 'Interface: %s does not exist\n' "$WLANIF"
+	fi
+	gw=$(default_gateway)
+	printf 'Default route: %s\n' "${gw:-none}"
+	sysctl dev.bcm4313.0.rxframes dev.bcm4313.0.txframes \
+		dev.bcm4313.0.txdone dev.bcm4313.0.txnomatch 2>/dev/null || true
+}
+
+diagnose()
+{
+	need_freebsd
+	need_root
+	printf '===== system =====\n'
+	uname -a
+	printf '\n===== loaded driver =====\n'
+	kldstat -m 'bhnd/if_bcm4313' 2>&1 || true
+	printf '\n===== net80211 devices =====\n'
+	sysctl net.wlan.devices 2>&1 || true
+	printf '\n===== interface =====\n'
+	ifconfig "$WLANIF" 2>&1 || true
+	printf '\n===== driver counters =====\n'
+	sysctl -a 2>/dev/null | grep '^dev.bcm4313' || true
+	printf '\n===== PCI =====\n'
+	pciconf -lv 2>/dev/null | grep -iA5 -e 14e4 -e broadcom || true
+	printf '\n===== recent kernel messages =====\n'
+	dmesg 2>/dev/null | grep -iE 'bcm4313|bhnd|wlan|d11|pci' | tail -40 || true
+}
+
+tui_msg()
+{
+	dialog --title "$PROGRAM" --msgbox "$1" 12 70
+}
+
+tui_ask_boot()
+{
+	[ "$MODE" = boot ] && return 0
+	if dialog --stdout --title "$PROGRAM" --yesno \
+		'Reconnect automatically at every boot?' 8 60; then
+		MODE=boot
+	fi
+}
+
+tui_scan_connect()
+{
+	TMP=$(umask 077; mktemp "${TMPDIR:-/tmp}/brcm-fbsd-scan.XXXXXXXX") ||
+		die "could not create a temporary scan file"
+	do_scan > "$TMP"
+	[ -s "$TMP" ] || { tui_msg 'No networks found.'; return 0; }
+	set --
+	while IFS="$(printf '\t')" read -r bssid name chan signal security; do
+		set -- "$@" "$bssid" "$name (ch $chan, $signal, $security)"
+	done < "$TMP"
+	sel=$(dialog --stdout --title "$PROGRAM" --menu 'Pick a network' 0 0 0 "$@") ||
+		return 0
+	line=$(grep "^${sel}" "$TMP" | head -1)
+	SSID=$(printf '%s\n' "$line" | cut -f2)
+	security=$(printf '%s\n' "$line" | cut -f5)
+	case "$security" in
+	open) OPEN=1 ;;
+	WPA)
+		PASS=$(dialog --stdout --title "$PROGRAM" --passwordbox \
+			"WPA password for '$SSID'" 8 60) || return 0
+		;;
+	*) tui_msg 'WEP is not supported by this configurator.'; return 0 ;;
+	esac
+	rm -f "$TMP"
+	TMP=""
+	tui_ask_boot
+	connect_inline
+}
+
+tui_manual_connect()
+{
+	SSID=$(dialog --stdout --title "$PROGRAM" --inputbox 'SSID' 8 60) || return 0
+	[ -n "$SSID" ] || return 0
+	if dialog --stdout --title "$PROGRAM" --yesno 'Is this an open network?' 8 60; then
+		OPEN=1
+	else
+		PASS=$(dialog --stdout --title "$PROGRAM" --passwordbox \
+			"WPA password for '$SSID'" 8 60) || return 0
+	fi
+	tui_ask_boot
+	connect_inline
+}
+
+tui_wpa_connect()
+{
+	WPA_FILE=$(dialog --stdout --title "$PROGRAM" --fselect \
+		"$WPA_CONF" 12 70) || return 0
+	WPA_FILE=$(printf '%s' "$WPA_FILE" | sed 's/[[:space:]]*$//')
+	tui_ask_boot
+	connect_wpa_file
+}
+
+tui_menu()
+{
+	while :; do
+		sel=$(dialog --stdout --title "$PROGRAM" --menu \
+			'BCM4313 FreeBSD configurator' 14 70 0 \
+			1 'Scan and connect' \
+			2 'Enter SSID manually' \
+			3 'Use a wpa_supplicant config' \
+			4 'Status' \
+			5 'Diagnostics' \
+			6 'Quit') || return 0
+		case "$sel" in
+		1) tui_scan_connect ;;
+		2) tui_manual_connect ;;
+		3) tui_wpa_connect ;;
+		4) TMP=$(mktemp); status > "$TMP"; tui_msg "$(cat "$TMP")"; rm -f "$TMP"; TMP="" ;;
+		5) TMP=$(mktemp); diagnose > "$TMP"; tui_msg "$(cat "$TMP")"; rm -f "$TMP"; TMP="" ;;
+		*) return 0 ;;
+		esac
+	done
+}
+
+plain_menu()
+{
+	while :; do
+		printf '\n%s\n' 'BRCM-FBSD-CONFIGURATOR'
+		printf '%s\n' \
+			'1) Scan and connect' \
+			'2) Enter SSID manually' \
+			'3) Use a wpa_supplicant config' \
+			'4) Status' \
+			'5) Diagnostics' \
+			'0) Quit'
+		printf 'Choice: '
+		read choice || return 0
+		case "$choice" in
+		1)
+			show_scan || true
+			printf 'SSID: '
+			read SSID || return 0
+			printf 'Open network? [y/N] '
+			read answer || return 0
+			case "$answer" in y|Y|yes|YES) OPEN=1 ;; esac
+			;;
+		2)
+			printf 'SSID: '
+			read SSID || return 0
+			printf 'Open network? [y/N] '
+			read answer || return 0
+			case "$answer" in y|Y|yes|YES) OPEN=1 ;; esac
+			;;
+		3)
+			printf 'wpa_supplicant config: '
+			read WPA_FILE || return 0
+			connect_wpa_file
+			continue
+			;;
+		4) status; continue ;;
+		5) diagnose; continue ;;
+		*) return 0 ;;
+		esac
+		[ -n "$SSID" ] || continue
+		if [ "$OPEN" -eq 0 ]; then
+			read_password
+		fi
+		printf 'Reconnect at boot? [y/N] '
+		read answer || return 0
+		case "$answer" in y|Y|yes|YES) MODE=boot ;; esac
+		connect_inline
+	done
+}
+
+menu()
+{
+	need_freebsd
+	need_root
+	if [ -z "${NO_TUI:-}" ] && [ -t 0 ] && [ -t 1 ] &&
+		command -v dialog >/dev/null 2>&1; then
+		tui_menu
+	else
+		plain_menu
+	fi
+}
+
+parse_connect()
+{
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--open) OPEN=1 ;;
+		--boot) MODE=boot ;;
+		--ping) PING=1 ;;
+		--recreate) RECREATE=1 ;;
+		--force) FORCE=1 ;;
+		--ask-password) ASK_PASS=1 ;;
+		--password-file)
+			shift
+			[ $# -gt 0 ] || die "--password-file needs a path"
+			PASSFILE=$1
+			;;
+		--timeout)
+			shift
+			[ $# -gt 0 ] || die "--timeout needs seconds"
+			TIMEOUT=$1
+			;;
+		-h|--help) usage; exit 0 ;;
+		-*) die "unknown connect option: $1" ;;
+		*)
+			[ -z "$SSID" ] || die "connect accepts exactly one SSID"
+			SSID=$1
+			;;
+		esac
+		shift
+	done
+	if [ "$OPEN" -eq 1 ] && { [ -n "$PASSFILE" ] || [ "$ASK_PASS" -eq 1 ]; }; then
+		die "--open cannot be combined with password options"
+	fi
+	connect_inline
+}
+
+parse_wpa()
+{
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--boot) MODE=boot ;;
+		--ping) PING=1 ;;
+		--recreate) RECREATE=1 ;;
+		--force) FORCE=1 ;;
+		--timeout)
+			shift
+			[ $# -gt 0 ] || die "--timeout needs seconds"
+			TIMEOUT=$1
+			;;
+		-h|--help) usage; exit 0 ;;
+		-*) die "unknown wpa option: $1" ;;
+		*)
+			[ -z "$WPA_FILE" ] || die "wpa accepts exactly one config file"
+			WPA_FILE=$1
+			;;
+		esac
+		shift
+	done
+	connect_wpa_file
+}
+
+[ $# -gt 0 ] || set -- menu
+command=$1
+shift
+case "$command" in
+-h|--help|help) usage ;;
+version|--version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
+menu) menu ;;
+status) status ;;
+scan)
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--recreate) RECREATE=1 ;;
+		-h|--help) usage; exit 0 ;;
+		*) die "unknown scan option: $1" ;;
+		esac
+		shift
+	done
+	show_scan
+	;;
+diagnose) diagnose ;;
+connect) parse_connect "$@" ;;
+wpa) parse_wpa "$@" ;;
+*) die "unknown command: $command (try --help)" ;;
+esac
